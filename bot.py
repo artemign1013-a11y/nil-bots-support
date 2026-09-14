@@ -13,7 +13,8 @@ from firebase_admin import credentials, firestore
 import config
 
 # ===== ИНИЦИАЛИЗАЦИЯ FIREBASE =====
-cred = credentials.Certificate("firebase-key.json")  # Скачай с Firebase
+cred_dict = json.loads(os.environ.get("FIREBASE_KEY_JSON"))
+cred = credentials.Certificate(cred_dict)
 firebase_admin.initialize_app(cred, config.FIREBASE_CONFIG)
 db = firestore.client()
 
