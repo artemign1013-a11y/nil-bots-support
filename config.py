@@ -1,8 +1,7 @@
-
 import os
 
-BOT_TOKEN = os.environ.get("8650697625:AAH8IWfbP_7o7kziD2aemyIPGak9l7JdVCY")
-ADMIN_ID = int(os.environ.get("5244755472"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 
 FIREBASE_CONFIG = {
     "apiKey": "AIzaSyBfx3lX593cjF2N2Aq9WcEK2Fn_pie3IT8",
