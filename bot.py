@@ -43,14 +43,27 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
+# Кэши для listener'а (чтобы не спамить уведомлениями)
+last_counts: dict = {}
+last_status: dict = {}
+
 
 class TicketState(StatesGroup):
     waiting_message = State()
 
 
 # ============================================
-# КЛАВИАТУРЫ
+# КЛАВИАТУРЫ И ТЕКСТЫ
 # ============================================
+def get_status_text(status: str) -> str:
+    return {
+        "new": "🟡 Новый",
+        "working": "🔵 В работе",
+        "resolved": "🟢 Решён",
+        "closed": "⚫ Закрыт"
+    }.get(status, "❓")
+
+
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Написать в поддержку", callback_data="new_ticket")],
@@ -66,15 +79,6 @@ def ticket_kb(ticket_id: str, status: str):
         buttons.append([InlineKeyboardButton(text="🔒 Закрыть тикет", callback_data=f"close_{ticket_id}")])
     buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def get_status_text(status: str) -> str:
-    return {
-        "new": "🟡 Новый",
-        "working": "🔵 В работе",
-        "resolved": "🟢 Решён",
-        "closed": "⚫ Закрыт"
-    }.get(status, "❓")
 
 
 # ============================================
@@ -107,6 +111,9 @@ def create_ticket(user_id, username, full_name, message_text) -> str:
         "updated_at": now,
         "messages": [{"from": "client", "text": message_text, "time": now}]
     })
+    # помечаем в кэше, чтобы listener не прислал дубли
+    last_counts[ref.id] = 1
+    last_status[ref.id] = "new"
     return ref.id
 
 
@@ -119,19 +126,32 @@ def add_message_to_ticket(ticket_id: str, from_who: str, text: str):
     messages = ticket.get("messages", [])
     messages.append({"from": from_who, "text": text, "time": datetime.datetime.now().isoformat()})
     ref.update({"messages": messages, "updated_at": datetime.datetime.now().isoformat()})
+    if from_who == "client":
+        last_counts[ticket_id] = len(messages)
 
 
 def get_user_tickets(user_id: int, limit: int = 10):
+    """БЕЗ order_by — сортируем в Python (иначе Firestore требует индекс)"""
     try:
         docs = db.collection("tickets")\
             .where("user_id", "==", user_id)\
-            .order_by("created_at", direction=firestore.Query.DESCENDING)\
-            .limit(limit)\
             .stream()
-        return [{"id": t.id, **t.to_dict()} for t in docs]
+        tickets = [{"id": t.id, **t.to_dict()} for t in docs]
+        tickets.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+        return tickets[:limit]
     except Exception as e:
         print(f"Ошибка получения тикетов: {e}")
         return []
+
+
+def get_ticket_status(ticket_id: str) -> str:
+    try:
+        doc = db.collection("tickets").document(ticket_id).get()
+        if doc.exists:
+            return doc.to_dict().get("status", "new")
+    except Exception:
+        pass
+    return "new"
 
 
 # ============================================
@@ -171,6 +191,18 @@ async def new_ticket(call: CallbackQuery, state: FSMContext):
     await state.set_state(TicketState.waiting_message)
 
 
+@router.callback_query(F.data.startswith("reply_"))
+async def reply_to_ticket(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    ticket_id = call.data.replace("reply_", "")
+    await state.update_data(ticket_id=ticket_id)  # запоминаем, КУДА писать
+    await call.message.edit_text(
+        f"✍️ <b>Напиши сообщение в тикет #{ticket_id[:6].upper()}:</b>\n\n<i>(отмена — /cancel)</i>",
+        parse_mode="HTML"
+    )
+    await state.set_state(TicketState.waiting_message)
+
+
 @router.message(TicketState.waiting_message, F.text)
 async def receive_message(message: Message, state: FSMContext):
     if message.text == "/cancel":
@@ -178,42 +210,64 @@ async def receive_message(message: Message, state: FSMContext):
         await message.answer("❌ Отменено.", reply_markup=main_kb())
         return
 
-    ticket_id = create_ticket(
-        message.from_user.id,
-        message.from_user.username or "",
-        message.from_user.full_name,
-        message.text
-    )
+    data = await state.get_data()
+    target_ticket = data.get("ticket_id")  # если пришли через "Написать ещё"
     await state.clear()
 
-    await message.answer(
-        f"✅ <b>Тикет создан!</b>\n\n🆔 Номер: <code>{ticket_id[:6].upper()}</code>\n\n"
-        "Разработчик ответит тебе прямо в этот чат.",
-        reply_markup=ticket_kb(ticket_id, "new"),
-        parse_mode="HTML"
-    )
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🎫 <b>Новый тикет #{ticket_id[:6].upper()}</b>\n\n"
-            f"👤 {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
-            f"🆔 <code>{message.from_user.id}</code>\n\n💬 {message.text}\n\n"
-            f"🔗 Ответить: https://nil-bots-site-with-bot.vercel.app",
+    is_new = False
+    if target_ticket:
+        # дописываем в существующий тикет
+        add_message_to_ticket(target_ticket, "client", message.text)
+        ticket_id = target_ticket
+    else:
+        active = find_active_ticket(message.from_user.id)
+        if active:
+            add_message_to_ticket(active["id"], "client", message.text)
+            ticket_id = active["id"]
+        else:
+            ticket_id = create_ticket(
+                message.from_user.id,
+                message.from_user.username or "",
+                message.from_user.full_name,
+                message.text
+            )
+            is_new = True
+
+    status = get_ticket_status(ticket_id)
+
+    if is_new:
+        await message.answer(
+            f"✅ <b>Тикет создан!</b>\n\n🆔 Номер: <code>{ticket_id[:6].upper()}</code>\n\n"
+            "Разработчик ответит тебе прямо в этот чат.",
+            reply_markup=ticket_kb(ticket_id, status),
             parse_mode="HTML"
         )
-    except Exception as e:
-        print(f"Не удалось уведомить админа: {e}")
-
-
-@router.callback_query(F.data.startswith("reply_"))
-async def reply_to_ticket(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    ticket_id = call.data.replace("reply_", "")
-    await call.message.edit_text(
-        f"✍️ <b>Напиши сообщение в тикет #{ticket_id[:6].upper()}:</b>\n\n<i>(отмена — /cancel)</i>",
-        parse_mode="HTML"
-    )
-    await state.set_state(TicketState.waiting_message)
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🎫 <b>Новый тикет #{ticket_id[:6].upper()}</b>\n\n"
+                f"👤 {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
+                f"🆔 <code>{message.from_user.id}</code>\n\n💬 {message.text}\n\n"
+                f"🔗 Ответить: https://nil-bots-site-with-bot.vercel.app",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Не удалось уведомить админа: {e}")
+    else:
+        await message.answer(
+            f"✅ Сообщение добавлено в тикет <b>#{ticket_id[:6].upper()}</b>",
+            reply_markup=ticket_kb(ticket_id, status),
+            parse_mode="HTML"
+        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"💬 <b>Сообщение в тикете #{ticket_id[:6].upper()}</b>\n\n"
+                f"👤 {message.from_user.full_name}\n\n{message.text}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
 
 @router.message(Command("cancel"))
@@ -291,6 +345,7 @@ async def close_ticket_handler(call: CallbackQuery):
         "status": "closed",
         "updated_at": datetime.datetime.now().isoformat()
     })
+    last_status[ticket_id] = "closed"  # чтобы listener не слал дубль
     await call.message.edit_text(
         f"🔒 <b>Тикет #{ticket_id[:6].upper()} закрыт.</b> Спасибо!",
         reply_markup=main_kb(),
@@ -320,30 +375,61 @@ async def back_main(call: CallbackQuery, state: FSMContext):
 
 
 # ============================================
-# LISTENER: ответы админа с сайта → клиенту в Telegram
+# LISTENER: ответы админа + смена статуса → клиенту
 # ============================================
 async def listen_for_replies():
     print("👂 Listener ответов админа запущен...")
-    last_counts: dict = {}
     while True:
         try:
-            docs = db.collection("tickets").where("status", "in", ["new", "working", "resolved"]).stream()
+            docs = db.collection("tickets")\
+                .where("status", "in", ["new", "working", "resolved", "closed"])\
+                .stream()
             for doc in docs:
                 ticket = doc.to_dict()
+                user_id = ticket.get("user_id")
                 messages = ticket.get("messages", [])
-                prev = last_counts.get(doc.id, 0)
-                if len(messages) > prev:
-                    for msg in messages[prev:]:
-                        if msg.get("from") == "admin":
+                status = ticket.get("status", "new")
+
+                # pertamaя встреча — просто запоминаем, без спама
+                if doc.id not in last_counts:
+                    last_counts[doc.id] = len(messages)
+                    last_status[doc.id] = status
+                    continue
+
+                # новые сообщения от админа
+                if len(messages) > last_counts[doc.id]:
+                    for msg in messages[last_counts[doc.id]:]:
+                        if msg.get("from") == "admin" and user_id:
                             try:
                                 await bot.send_message(
-                                    ticket.get("user_id"),
-                                    f"🛠️ <b>Ответ поддержки</b> (#{doc.id[:6].upper()}):\n\n{msg['text']}",
+                                    user_id,
+                                    f"🛠️ <b>Ответ поддержки</b> (тикет #{doc.id[:6].upper()}):\n\n"
+                                    f"{msg['text']}\n\n"
+                                    f"💬 <i>Чтобы мы увидели твоё сообщение — ответь прямо на это сообщение!</i>",
                                     parse_mode="HTML"
                                 )
                             except Exception as e:
                                 print(f"Ошибка отправки ответа: {e}")
                     last_counts[doc.id] = len(messages)
+
+                # смена статуса
+                if status != last_status.get(doc.id):
+                    last_status[doc.id] = status
+                    if user_id:
+                        extra = ""
+                        if status == "closed":
+                            extra = "\n\nСпасибо за обращение! Если вопрос снова появится — создай новый тикет."
+                        elif status == "resolved":
+                            extra = "\n\nЕсли всё хорошо — можешь закрыть тикет. Если нет — напиши в него ещё."
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                f"📊 <b>Статус тикета #{doc.id[:6].upper()} изменился</b>\n\n"
+                                f"Новый статус: {get_status_text(status)}{extra}",
+                                parse_mode="HTML"
+                            )
+                        except Exception as e:
+                            print(f"Ошибка уведомления о статусе: {e}")
             await asyncio.sleep(3)
         except Exception as e:
             print(f"Ошибка listener: {e}")
