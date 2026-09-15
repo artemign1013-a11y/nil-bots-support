@@ -43,10 +43,6 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# Кэши для listener'а (чтобы не спамить уведомлениями)
-last_counts: dict = {}
-last_status: dict = {}
-
 
 class TicketState(StatesGroup):
     waiting_message = State()
@@ -111,9 +107,6 @@ def create_ticket(user_id, username, full_name, message_text) -> str:
         "updated_at": now,
         "messages": [{"from": "client", "text": message_text, "time": now}]
     })
-    # помечаем в кэше, чтобы listener не прислал дубли
-    last_counts[ref.id] = 1
-    last_status[ref.id] = "new"
     return ref.id
 
 
@@ -126,12 +119,9 @@ def add_message_to_ticket(ticket_id: str, from_who: str, text: str):
     messages = ticket.get("messages", [])
     messages.append({"from": from_who, "text": text, "time": datetime.datetime.now().isoformat()})
     ref.update({"messages": messages, "updated_at": datetime.datetime.now().isoformat()})
-    if from_who == "client":
-        last_counts[ticket_id] = len(messages)
 
 
 def get_user_tickets(user_id: int, limit: int = 10):
-    """БЕЗ order_by — сортируем в Python (иначе Firestore требует индекс)"""
     try:
         docs = db.collection("tickets")\
             .where("user_id", "==", user_id)\
@@ -195,7 +185,7 @@ async def new_ticket(call: CallbackQuery, state: FSMContext):
 async def reply_to_ticket(call: CallbackQuery, state: FSMContext):
     await call.answer()
     ticket_id = call.data.replace("reply_", "")
-    await state.update_data(ticket_id=ticket_id)  # запоминаем, КУДА писать
+    await state.update_data(ticket_id=ticket_id)
     await call.message.edit_text(
         f"✍️ <b>Напиши сообщение в тикет #{ticket_id[:6].upper()}:</b>\n\n<i>(отмена — /cancel)</i>",
         parse_mode="HTML"
@@ -211,12 +201,11 @@ async def receive_message(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    target_ticket = data.get("ticket_id")  # если пришли через "Написать ещё"
+    target_ticket = data.get("ticket_id")
     await state.clear()
 
     is_new = False
     if target_ticket:
-        # дописываем в существующий тикет
         add_message_to_ticket(target_ticket, "client", message.text)
         ticket_id = target_ticket
     else:
@@ -375,65 +364,79 @@ async def back_main(call: CallbackQuery, state: FSMContext):
 
 
 # ============================================
-# LISTENER: ответы админа + смена статуса → клиенту
+# LISTENER: on_snapshot (ЭКОНОМИТ ЛИМИТЫ FIREBASE)
 # ============================================
-async def listen_for_replies():
-    print("👂 Listener ответов админа запущен...")
-    while True:
-        try:
-            docs = db.collection("tickets")\
-                .where("status", "in", ["new", "working", "resolved", "closed"])\
-                .stream()
-            for doc in docs:
-                ticket = doc.to_dict()
-                user_id = ticket.get("user_id")
-                messages = ticket.get("messages", [])
-                status = ticket.get("status", "new")
+last_counts: dict = {}
+last_status: dict = {}
+MAIN_LOOP = None
 
-                # pertamaя встреча — просто запоминаем, без спама
-                if doc.id not in last_counts:
-                    last_counts[doc.id] = len(messages)
-                    last_status[doc.id] = status
-                    continue
 
-                # новые сообщения от админа
-                if len(messages) > last_counts[doc.id]:
-                    for msg in messages[last_counts[doc.id]:]:
-                        if msg.get("from") == "admin" and user_id:
-                            try:
-                                await bot.send_message(
-                                    user_id,
-                                    f"🛠️ <b>Ответ поддержки</b> (тикет #{doc.id[:6].upper()}):\n\n"
-                                    f"{msg['text']}\n\n"
-                                    f"💬 <i>Чтобы мы увидели твоё сообщение — ответь прямо на это сообщение!</i>",
-                                    parse_mode="HTML"
-                                )
-                            except Exception as e:
-                                print(f"Ошибка отправки ответа: {e}")
-                    last_counts[doc.id] = len(messages)
+def _firestore_listener(snapshot, changes, read_time):
+    """Firebase сам пушит изменения — мы НЕ опрашиваем базу каждые 3 секунды"""
+    for change in changes:
+        doc_id = change.document.id
+        data = change.document.to_dict()
+        if MAIN_LOOP:
+            MAIN_LOOP.call_soon_threadsafe(
+                MAIN_LOOP.create_task, process_change(doc_id, data)
+            )
 
-                # смена статуса
-                if status != last_status.get(doc.id):
-                    last_status[doc.id] = status
-                    if user_id:
-                        extra = ""
-                        if status == "closed":
-                            extra = "\n\nСпасибо за обращение! Если вопрос снова появится — создай новый тикет."
-                        elif status == "resolved":
-                            extra = "\n\nЕсли всё хорошо — можешь закрыть тикет. Если нет — напиши в него ещё."
-                        try:
-                            await bot.send_message(
-                                user_id,
-                                f"📊 <b>Статус тикета #{doc.id[:6].upper()} изменился</b>\n\n"
-                                f"Новый статус: {get_status_text(status)}{extra}",
-                                parse_mode="HTML"
-                            )
-                        except Exception as e:
-                            print(f"Ошибка уведомления о статусе: {e}")
-            await asyncio.sleep(3)
-        except Exception as e:
-            print(f"Ошибка listener: {e}")
-            await asyncio.sleep(5)
+
+async def process_change(doc_id: str, ticket: dict):
+    user_id = ticket.get("user_id")
+    messages = ticket.get("messages", [])
+    status = ticket.get("status", "new")
+
+    # первая встреча — просто запоминаем, без спама
+    if doc_id not in last_counts:
+        last_counts[doc_id] = len(messages)
+        last_status[doc_id] = status
+        return
+
+    # новые сообщения от админа (ответил с сайта) → шлём клиенту
+    if len(messages) > last_counts[doc_id]:
+        for msg in messages[last_counts[doc_id]:]:
+            if msg.get("from") == "admin" and user_id:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🛠️ <b>Ответ поддержки</b> (тикет #{doc_id[:6].upper()}):\n\n"
+                        f"{msg['text']}\n\n"
+                        f"💬 <i>Чтобы мы увидели твоё сообщение — ответь прямо на это сообщение!</i>",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    print(f"Ошибка отправки ответа: {e}")
+        last_counts[doc_id] = len(messages)
+
+    # смена статуса → уведомление клиенту
+    if status != last_status.get(doc_id):
+        last_status[doc_id] = status
+        if user_id:
+            extra = ""
+            if status == "closed":
+                extra = "\n\nСпасибо за обращение! Если вопрос снова появится — создай новый тикет."
+            elif status == "resolved":
+                extra = "\n\nЕсли всё хорошо — можешь закрыть тикет. Если нет — напиши в него ещё."
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"📊 <b>Статус тикета #{doc_id[:6].upper()} изменился</b>\n\n"
+                    f"Новый статус: {get_status_text(status)}{extra}",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                print(f"Ошибка уведомления о статусе: {e}")
+
+
+def start_firestore_listener():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_event_loop()
+    q = db.collection("tickets").where(
+        "status", "in", ["new", "working", "resolved", "closed"]
+    )
+    q.on_snapshot(_firestore_listener)
+    print("👂 Listener (on_snapshot) запущен — экономим лимиты Firebase")
 
 
 # ============================================
@@ -442,11 +445,8 @@ async def listen_for_replies():
 async def main():
     print("🎫 Бот поддержки запущен!")
     print(f"👑 Admin ID: {ADMIN_ID}")
-    listener = asyncio.create_task(listen_for_replies())
-    try:
-        await dp.start_polling(bot)
-    finally:
-        listener.cancel()
+    start_firestore_listener()
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
