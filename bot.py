@@ -64,7 +64,22 @@ def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Написать в поддержку", callback_data="new_ticket")],
         [InlineKeyboardButton(text="📋 Мои тикеты", callback_data="my_tickets")],
+        [InlineKeyboardButton(text="📄 Документация", callback_data="docs")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
+    ])
+
+
+def docs_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Политика конфиденциальности",
+            url="https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-08-12-99"
+        )],
+        [InlineKeyboardButton(
+            text="Пользовательское соглашение",
+            url="https://telegra.ph/PUBLICHNAYA-OFERTA-08-12-15"
+        )],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")]
     ])
 
 
@@ -338,6 +353,16 @@ async def close_ticket_handler(call: CallbackQuery):
     await call.message.edit_text(
         f"🔒 <b>Тикет #{ticket_id[:6].upper()} закрыт.</b> Спасибо!",
         reply_markup=main_kb(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "docs")
+async def docs_handler(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "📄 <b>Документация</b>\n\nВыбери документ:",
+        reply_markup=docs_kb(),
         parse_mode="HTML"
     )
 
