@@ -18,7 +18,7 @@ from aiohttp import web  # <<< NEW: health-сервер для Render
 # ============================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-SITE_URL = os.environ.get("SITE_URL", "https://nil-site-web.vercel.app/")  # <<< NEW: из env
+SITE_URL = os.environ.get("SITE_URL", "https://nil-bots-site-with-bot.vercel.app/")  # <<< NEW: из env
 
 if not BOT_TOKEN:
     raise SystemExit("❌ Переменная BOT_TOKEN не задана!")
