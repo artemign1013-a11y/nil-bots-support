@@ -11,13 +11,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from google.cloud.firestore_v1 import FieldFilter
 import firebase_admin
 from firebase_admin import credentials, firestore
+from aiohttp import web  # <<< NEW: health-сервер для Render
 
 # ============================================
 # НАСТРОЙКИ
 # ============================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-SITE_URL = "https://nil-bots-site-with-bot.vercel.app/"
+SITE_URL = os.environ.get("SITE_URL", "https://nil-site-web.vercel.app/")  # <<< NEW: из env
 
 if not BOT_TOKEN:
     raise SystemExit("❌ Переменная BOT_TOKEN не задана!")
@@ -48,6 +49,9 @@ MAIN_LOOP = None
 last_counts = {}
 last_status = {}
 
+def hesc(s):  # <<< NEW: экранирование текста перед parse_mode="HTML"
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 @router.errors()
 async def on_handler_error(event: ErrorEvent):
     print(f"🔥 ХЕНДЛЕР УПАЛ: {type(event.exception).__name__}: {event.exception}")
@@ -71,7 +75,7 @@ def get_status_text(status: str) -> str:
         "new": "🟡 Новый",
         "working": "🔵 В работе",
         "resolved": "🟢 Решён",
-        "closed": "⚫ Закрыт",
+        "closed": " Закрыт",
     }.get(status, "❓")
 
 def main_kb():
@@ -89,6 +93,13 @@ def ticket_kb(ticket_id: str, status: str):
         buttons.append([InlineKeyboardButton(text="🔒 Закрыть тикет", callback_data=f"close_{ticket_id}")])
     buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# <<< NEW: клавиатура оценки поддержки
+def rating_kb(ticket_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{i}⭐", callback_data=f"rate:{ticket_id}:{i}") for i in range(1, 6)],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")],
+    ])
 
 # ============================================
 # FIREBASE-ХЕЛПЕРЫ
@@ -164,7 +175,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     active = find_active_ticket(message.from_user.id)
     text = (
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"👋 <b>Привет, {hesc(message.from_user.first_name)}!</b>\n\n"
         "Я — бот технической поддержки <b>Nil Bots</b>.\n\n"
         "• ✍️ Напиши вопрос или сообщи о проблеме\n"
         "• 📋 Смотри историю своих обращений\n"
@@ -242,8 +253,8 @@ async def receive_message(message: Message, state: FSMContext):
             await bot.send_message(
                 ADMIN_ID,
                 f"🎫 <b>Новый тикет #{ticket_id[:6].upper()}</b>\n\n"
-                f"👤 {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
-                f"🆔 <code>{message.from_user.id}</code>\n\n💬 {message.text}\n\n"
+                f"👤 {hesc(message.from_user.full_name)} (@{hesc(message.from_user.username or '—')})\n"
+                f"🆔 <code>{message.from_user.id}</code>\n\n💬 {hesc(message.text)}\n\n"
                 f"🔗 Ответить: {SITE_URL}",
                 parse_mode="HTML"
             )
@@ -258,7 +269,7 @@ async def receive_message(message: Message, state: FSMContext):
             await bot.send_message(
                 ADMIN_ID,
                 f"💬 <b>Сообщение в тикете #{ticket_id[:6].upper()}</b>\n\n"
-                f"👤 {message.from_user.full_name}\n\n{message.text}",
+                f"👤 {hesc(message.from_user.full_name)}\n\n{hesc(message.text)}",
                 parse_mode="HTML"
             )
         except Exception:
@@ -282,7 +293,7 @@ async def handle_text(message: Message, state: FSMContext):
             await bot.send_message(
                 ADMIN_ID,
                 f"💬 <b>Сообщение в тикете #{active['id'][:6].upper()}</b>\n\n"
-                f"👤 {message.from_user.full_name}\n\n{message.text}",
+                f"👤 {hesc(message.from_user.full_name)}\n\n{hesc(message.text)}",
                 parse_mode="HTML"
             )
         except Exception:
@@ -306,7 +317,9 @@ async def my_tickets(call: CallbackQuery):
     text = "📋 <b>Твои тикеты:</b>\n\n"
     buttons = []
     for t in tickets:
-        text += f"• <b>#{t['id'][:6].upper()}</b> — {get_status_text(t.get('status'))} ({str(t.get('created_at', ''))[:10]})\n"
+        rating = t.get("rating")
+        mark = f" · {'⭐'*rating}" if rating else ""
+        text += f"• <b>#{t['id'][:6].upper()}</b> — {get_status_text(t.get('status'))}{mark} ({str(t.get('created_at', ''))[:10]})\n"
         buttons.append([InlineKeyboardButton(text=f"📄 #{t['id'][:6].upper()}", callback_data=f"view_{t['id']}")])
     buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -323,7 +336,7 @@ async def view_ticket(call: CallbackQuery):
     text = f"🎫 <b>Тикет #{ticket_id[:6].upper()}</b>\n📊 {get_status_text(ticket.get('status'))}\n\n"
     for msg in ticket.get("messages", [])[-10:]:
         who = "👤 Ты" if msg["from"] == "client" else "🛠️ Поддержка"
-        text += f"<b>{who}:</b> {msg['text'][:300]}\n\n"
+        text += f"<b>{who}:</b> {hesc(msg['text'])[:300]}\n\n"
     await call.message.edit_text(text, reply_markup=ticket_kb(ticket_id, ticket.get("status", "new")), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("close_"))
@@ -339,6 +352,70 @@ async def close_ticket_handler(call: CallbackQuery):
         f"🔒 <b>Тикет #{ticket_id[:6].upper()} закрыт.</b> Спасибо!",
         reply_markup=main_kb(), parse_mode="HTML"
     )
+
+# <<< NEW: обработка оценки поддержки
+@router.callback_query(F.data.startswith("rate:"))
+async def rate_support(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        await call.answer()
+        return
+    ticket_id, rating_s = parts[1], parts[2]
+    try:
+        rating = int(rating_s)
+    except ValueError:
+        await call.answer()
+        return
+    await call.answer("Спасибо за оценку! ⭐")
+
+    ref = db.collection("tickets").document(ticket_id)
+    doc = ref.get()
+    if not doc.exists:
+        return
+    t = doc.to_dict()
+    if t.get("rated"):  # повторная оценка — убираем клавиатуру и выходим
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    now = datetime.datetime.now().isoformat()
+    ref.update({"rating": rating, "rated": True, "rated_at": now, "rated_by": call.from_user.id})
+
+    # статистика оценок (отдельная коллекция)
+    try:
+        db.collection("ratings").add({
+            "ticket_id": ticket_id,
+            "ticket_num": ticket_id[:6].upper(),
+            "user_id": call.from_user.id,
+            "username": call.from_user.username or "",
+            "full_name": call.from_user.full_name,
+            "rating": rating,
+            "created_at": now,
+        })
+    except Exception as e:
+        print(f"Не удалось записать оценку: {e}")
+
+    # уведомление админу — КАЖДАЯ оценка
+    stars = "⭐" * rating
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"📊 <b>Новая оценка поддержки</b>\n\n"
+            f"🎫 Тикет: <code>#{ticket_id[:6].upper()}</code>\n"
+            f"👤 {hesc(call.from_user.full_name)} (@{hesc(call.from_user.username or '—')})\n"
+            f"⭐ Оценка: {stars} ({rating}/5)",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Не удалось отправить оценку админу: {e}")
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(f"✅ Спасибо! Твоя оценка поддержки учтена: {stars}")
 
 @router.callback_query(F.data == "help")
 async def help_handler(call: CallbackQuery):
@@ -360,7 +437,7 @@ async def back_main(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_kb(), parse_mode="HTML")
 
 # ============================================
-# LISTENER: ответы админа с сайта → клиенту (on_snapshot, экономит лимиты)
+# LISTENER: ответы админа с сайта → клиенту (on_snapshot)
 # ============================================
 def _on_tickets(snapshot, changes, read_time):
     for change in changes:
@@ -385,40 +462,53 @@ async def process_change(doc_id: str, ticket: dict, change_type: str):
         last_status[doc_id] = status
         return
 
-    # новые сообщения от админа (ответил с сайта) → шлём клиенту
+    # <<< NEW: формат сообщения с ответом модератора
     if len(messages) > last_counts[doc_id]:
         for msg in messages[last_counts[doc_id]:]:
             if msg.get("from") == "admin" and user_id:
                 try:
                     await bot.send_message(
                         user_id,
-                        f"🛠️ <b>Ответ поддержки</b> (тикет #{doc_id[:6].upper()}):\n\n"
-                        f"{msg['text']}\n\n"
-                        f"💬 <i>Чтобы мы увидели твоё сообщение — ответь прямо на это сообщение!</i>",
+                        f"🛠️ <b>Ответ от модератора по тикету #{doc_id[:6].upper()}</b>\n\n"
+                        f"{hesc(msg['text'])}\n\n"
+                        f"💬 <i>Для продолжения тикета ответьте на это сообщение, "
+                        f"иначе мы не увидим ваш ответ!</i>",
                         parse_mode="HTML",
                     )
                 except Exception as e:
                     print(f"Ошибка отправки ответа: {e}")
         last_counts[doc_id] = len(messages)
 
-    # смена статуса → уведомление клиенту
+    # смена статуса → уведомление клиенту (+ <<< NEW: предложение оценить при закрытии/решении)
     if status != last_status.get(doc_id):
         last_status[doc_id] = status
         if user_id:
-            extra = ""
-            if status == "closed":
-                extra = "\n\nСпасибо за обращение! Если вопрос вернётся — создай новый тикет."
-            elif status == "resolved":
-                extra = "\n\nЕсли всё хорошо — можешь закрыть тикет. Если нет — напиши в него ещё."
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"📊 <b>Статус тикета #{doc_id[:6].upper()} изменился</b>\n\n"
-                    f"Новый статус: {get_status_text(status)}{extra}",
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                print(f"Ошибка уведомления о статусе: {e}")
+            if status in ("resolved", "closed") and not ticket.get("rating_sent"):
+                extra = ("\n\nСпасибо за обращение! Если вопрос вернётся — создай новый тикет."
+                         if status == "closed" else
+                         "\n\nЕсли всё хорошо — можешь закрыть тикет. Если нет — напиши в него ещё.")
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"📊 <b>Статус тикета #{doc_id[:6].upper()} изменился</b>\n\n"
+                        f"Новый статус: {get_status_text(status)}{extra}\n\n"
+                        f"💬 <b>Оцени, пожалуйста, службу поддержки</b> — насколько хорошо тебе помогли?",
+                        reply_markup=rating_kb(doc_id),
+                        parse_mode="HTML",
+                    )
+                    db.collection("tickets").document(doc_id).update({"rating_sent": True})
+                except Exception as e:
+                    print(f"Ошибка запроса оценки: {e}")
+            else:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"📊 <b>Статус тикета #{doc_id[:6].upper()} изменился</b>\n\n"
+                        f"Новый статус: {get_status_text(status)}",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    print(f"Ошибка уведомления о статусе: {e}")
 
 def start_tickets_listener():
     global MAIN_LOOP
@@ -430,11 +520,29 @@ def start_tickets_listener():
     print("👂 Listener тикетов (on_snapshot) запущен")
 
 # ============================================
+# <<< NEW: HEALTH-СЕРВЕР (чтобы Render не усыплял бота)
+# ============================================
+async def _health(request):
+    return web.Response(text="ok")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/health", _health)
+    app.router.add_get("/", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"🩺 Health-сервер слушает :{port}")
+
+# ============================================
 # ЗАПУСК
 # ============================================
 async def main():
     print("🎫 Бот поддержки запущен!")
     print(f"👑 Admin ID: {ADMIN_ID}")
+    await start_health_server()
     start_tickets_listener()
     await dp.start_polling(bot)
 
