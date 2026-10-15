@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: nil-bots-support
+    runtime: python
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: FIREBASE_KEY_JSON
+        sync: false
+      - key: SITE_URL
+        sync: false
+    plan: free
